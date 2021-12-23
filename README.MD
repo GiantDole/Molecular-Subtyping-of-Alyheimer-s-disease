@@ -23,3 +23,7 @@ While the authors have used a random forest ML model, we wanted to train differe
 CatBoost_BAG_L1 was the best performant model. Seperating the gene expression data randomly into 20% training data and 80% training data has only resulted in an accuracy of 50%.
 Not using the significant genes but choosing the genes through mutual_info_classif has returned better results, but we believe if the clustering algorithm was improved this methodology would be better.
 The clustering algorithm we currently use is unfortunately unbalanced and return a poor cluster #1.
+
+
+R HTML files:
+The knitted R files are added to both R HTML rar files.
