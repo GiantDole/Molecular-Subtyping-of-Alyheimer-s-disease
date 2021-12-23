@@ -1,0 +1,83 @@
+---
+title: "Genomics Project Clustering"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+for (pkg in c("BiocManager", "data.table")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+
+for (pkg in c("data.table", "multiClust")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+```
+
+```{r}
+library(multiClust)
+
+MSBBDATA <- "data/MSBB"
+
+msbb_phg_fn <- "msbb_phg_tocluster.txt"
+
+exp_file <- file.path(MSBBDATA, msbb_phg_fn)
+
+data.exprs <- input_file(input=exp_file)
+
+data.exprs
+```
+Determine the optimal number of clusters with number_clusters of the multiClust package. The computation took us around two hours and resulted in the optimal number of 3 clusters.
+
+See section 4 of https://www.bioconductor.org/packages/devel/bioc/vignettes/multiClust/inst/doc/multiClust.html#cluster-analysis-of-selected-genes-and-samples.
+
+```{r}
+library(multiClust)
+
+#cluster_num <- number_clusters(data.exp=msbb_phg, Fixed=NULL,
+#    gap_statistic=TRUE)
+#cluster_num
+```
+
+Performing gene selection on the gene expression data using the probe_ranking() function. As a probe number we selected 300 feature genes.
+```{r}
+ranked.exprs <- probe_ranking(input=exp_file,
+    probe_number=10000, 
+    probe_num_selection="Fixed_Probe_Num",
+    data.exp=data.exprs, 
+    method="SD_Rank")
+
+ranked.exprs
+```
+
+Now, as we have determine the optimal number of clusters, we will cluster the gene expressions into these clusters using the cluster_analysis method().
+```{r}
+hclust_analysis <- cluster_analysis(sel.exp=ranked.exprs,
+    cluster_type="HClust",
+    distance="euclidean", linkage_type="ward.D2", 
+    gene_distance="correlation",
+    num_clusters=3, data_name="MSBB PHG Altzheimer Disease", 
+    probe_rank="SD_Rank", probe_num_selection="Fixed_Probe_Num",
+    cluster_num_selection="Fixed_Clust_Num")
+
+
+#source: https://stackoverflow.com/questions/10266963/moving-files-between-folders
+my.file.rename <- function(from, to) {
+    todir <- dirname(to)
+    if (!isTRUE(file.info(todir)$isdir)) dir.create(todir, recursive=TRUE)
+    file.rename(from = from,  to = to)
+}
+
+my.file.rename(from = "MSBB PHG Altzheimer Disease HClust euclidean ward.D2 SD_Rank Fixed_Probe_Num Fixed_Clust_Num Samples.Clusters.csv",
+               to = "data/MSBB/msbb_phg_clusters.csv")
+```
+```{r}
+hclust_analysis
+```
+

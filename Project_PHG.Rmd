@@ -1,0 +1,231 @@
+---
+title: "Genomics Project Differential Gene Expression Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+```{r}
+for (pkg in c("BiocManager", "data.table", "tidyverse", "magrittr", "impute")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+#https://www.bioconductor.org/packages/devel/bioc/vignettes/multiClust/inst/doc/multiClust.html
+for (pkg in c("limma", "edgeR", "GO.db", "data.table", "splitstackshape", "multiClust", "qvalue", "genefilter")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+
+
+```
+
+```{r}
+library("data.table")
+
+MSBBDATA <- "data/MSBB"
+
+#Do we rather need the normalized data?
+msbb_phg_fn <- "AMP-AD_MSBB_MSSM_BM_36.raw_counts.tsv"
+
+msbb_phg <- data.frame(fread(file.path(MSBBDATA, msbb_phg_fn)),
+                 row.names = 1, check.names = FALSE)
+
+msbb_phg
+```
+First, we remove the low expressive genes using a function from here: https://seqqc.wordpress.com/2020/02/17/removing-low-count-genes-for-rna-seq-downstream-analysis/.
+This leaves us with ~30% of the genes.
+
+```{r}
+library(genefilter)
+
+selectGenes <- function(counts, min.count=10, N=0.90){
+ 
+  lib.size <- colSums(counts)
+  MedianLibSize <- median(lib.size)
+  CPM.Cutoff <- min.count / MedianLibSize*1e6
+  CPM <- edgeR::cpm(counts,lib.size=lib.size)
+ 
+  min.samples <- round(N * ncol(counts))
+ 
+  f1 <- genefilter::kOverA(min.samples, CPM.Cutoff)
+  flist <- genefilter::filterfun(f1)
+  keep <- genefilter::genefilter(CPM, flist)
+ 
+  ## the same as:
+  #keep <- apply(CPM, 1, function(x, n = min.samples){
+  #  t = sum(x >= CPM.Cutoff) >= n
+  #  t
+  #})
+ 
+  return(keep)
+}
+ 
+keep.exprs <- selectGenes(msbb_phg, min.count=10, N=0.90)
+msbb_phg <- msbb_phg[keep.exprs,]
+write.table(msbb_phg, "data/MSBB/msbb_phg_reduced_raw_count.txt", sep = "\t")
+msbb_phg
+```
+
+
+```{r}
+meta_file_path <- "MSBB_individual_metadata.csv"
+meta_msbb <- read.csv(file.path(MSBBDATA, meta_file_path),
+                   check.names = FALSE, row.names=1,
+                   stringsAsFactors = FALSE, header = TRUE)
+#meta <- meta[complete.cases(meta$plaqueMean), ]
+meta_msbb
+```
+
+```{r}
+biospecimen_file_path <- "MSBB_biospecimen_metadata.csv"
+
+biospecimen_msbb <- read.csv(file.path(MSBBDATA, biospecimen_file_path),
+                   check.names = FALSE,
+                   stringsAsFactors = FALSE, 
+                   header = TRUE)
+#
+#Paper filters out the unknown specimen as well
+#
+#there are duplicate individualIDs for the different MSBB raw count files
+#
+biospecimen_msbb <- biospecimen_msbb[((biospecimen_msbb$individualID != "")&(biospecimen_msbb$individualID != "Unknown")),]
+
+biospecimen_msbb
+```
+
+
+```{r}
+biospecimen_phg <- biospecimen_msbb[biospecimen_msbb$tissue == "parahippocampal gyrus",]
+
+biospecimen_phg
+```
+
+```{r}
+meta_phg <- merge(biospecimen_phg, meta_msbb, by.x = "individualID", by.y=0)
+
+meta_phg
+```
+```{r}
+sample_meta_phg <- data.frame(specimenID=colnames(msbb_phg))
+meta_phg_m <- merge(meta_phg, sample_meta_phg, by.x="specimenID", by.y="specimenID")
+
+meta_phg_m <- subset(meta_phg_m,meta_phg_m$CDR>=1.0 | meta_phg_m$CDR == 0)
+
+#meta_phg_m <- transform(meta_phg_m, is_demented= ifelse(CDR==0, FALSE, TRUE))
+
+msbb_phg <- msbb_phg[, meta_phg_m$specimenID]
+
+write.table(meta_phg_m, "data/MSBB/msbb_phg_traits.txt", sep = "\t")
+
+meta_phg_m
+```
+Here, we separate the control gene expression data from the gene expression data that will be clustered in the next step. As done in the paper each cluster that we get is then compared with the control data.
+
+```{r}
+meta_phg_m_tocluster <- subset(meta_phg_m,meta_phg_m$CDR>=1.0)
+
+msbb_phg_tocluster <- msbb_phg[, meta_phg_m_tocluster$specimenID]
+
+write.table(msbb_phg_tocluster, "data/MSBB/msbb_phg_tocluster.txt", sep = "\t")
+
+meta_phg_m_control <- subset(meta_phg_m,meta_phg_m$CDR==0.0)
+
+msbb_phg_control <- msbb_phg[, meta_phg_m_control$specimenID]
+
+meta_phg_m_control
+```
+
+
+Loading the clusters that were output by the Project_Clustering.Rmd program.
+```{r}
+cluster_fn <- "msbb_phg_clusters.csv"
+
+clusters <- read.csv(file.path(MSBBDATA, cluster_fn),
+                   check.names = FALSE,
+                   stringsAsFactors = FALSE, 
+                   header = TRUE)
+
+colnames(clusters) <- c("specimenID", "cluster")
+
+clusters
+```
+Assigning the clusters to the given IDs in our meta table meta_phg_m_tocluster which contains metadata for all the "cluster" samples. The control group (CDR == 0) will be assigned cluster 0.
+```{r}
+meta_phg_m_cluster <- merge(meta_phg_m, clusters, by.x="specimenID", by.y="specimenID", all.x = TRUE)
+
+meta_phg_m_cluster <- transform(meta_phg_m_cluster, cluster= ifelse(CDR==0, 0, cluster))
+
+meta_phg_m_cluster
+```
+Validate results above. (Should be 32 control (0) and in total 150 clusters (1,2, or 3)).
+```{r}
+table(meta_phg_m_cluster$cluster)
+```
+Create a column for every cluster and the control group.
+```{r}
+meta_phg_m_cluster <- transform(meta_phg_m_cluster, control= ifelse(cluster==0, 1, 0))
+
+meta_phg_m_cluster <- transform(meta_phg_m_cluster, cluster1= ifelse(cluster==1, 1, 0))
+
+meta_phg_m_cluster <- transform(meta_phg_m_cluster, cluster2= ifelse(cluster==2, 1, 0))
+
+meta_phg_m_cluster <- transform(meta_phg_m_cluster, cluster3= ifelse(cluster==3, 1, 0))
+
+meta_phg_m_cluster
+```
+
+
+```{r}
+meta_cluster1 <- subset(meta_phg_m_cluster, meta_phg_m_cluster$cluster == 1)
+meta_cluster2 <- subset(meta_phg_m_cluster, meta_phg_m_cluster$cluster == 2)
+meta_cluster3 <- subset(meta_phg_m_cluster, meta_phg_m_cluster$cluster == 3)
+```
+To perform differential gene expression analysis, we first fit all data except for samples with mixed neuropathology (CDR == 0.5). We have labeled the data already for controls and clusters in metadata meta_phg_m_cluster and filtered out the mixed neuropathology gene expression data in msbb_phg.
+```{r}
+library(edgeR)
+
+dgelist <- DGEList(
+  counts = msbb_phg,
+  group = NULL,
+  remove.zeros = FALSE,
+  samples = meta_phg_m_cluster,
+  genes = rownames(msbb_phg)
+)
+design <- model.matrix(~ CDR + factor(cluster), data=meta_phg_m_cluster)
+colnames(design) <- c("CDR", "control", "cluster1", "cluster2", "cluster3")
+
+ 
+keep <- filterByExpr(dgelist, design=design)
+dgelist <- dgelist[keep,,keep.lib.sizes=FALSE]
+dgelist <- calcNormFactors(dgelist, method="TMM")
+dgelist <- estimateDisp(dgelist, design)
+v <- voom(dgelist, design, plot=TRUE)
+
+
+fit <- lmFit(v, design)
+```
+
+```{r}
+contrast.matrix <- makeContrasts(control-cluster1, control-cluster2, control-cluster3, levels=design) 
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+topTable(fit2)
+```
+```{r}
+library(qvalue)
+
+qobj <- qvalue(fit2$p.value)
+plot(qobj)
+```
+
+```{r}
+summary(qobj)
+```
+```{r}
+write.qvalue(qobj, file = "qvalue.txt", sep = " ")
+```
+

@@ -1,0 +1,252 @@
+---
+title: "Genomic Project WGCNA Gene Clustering and Correlation"
+output:
+  html_document:
+    df_print: paged
+---
+
+Using https://wikis.utexas.edu/display/bioiteam/Clustering+using+WGCNA as guidance.
+
+```{r}
+for (pkg in c("BiocManager", "data.table")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+
+for (pkg in c("data.table", "flashClust", "WGCNA", "genefilter")) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, update = FALSE, ask = FALSE)
+  }
+}
+```
+
+```{r}
+MSBBDATA <- "data/MSBB"
+
+msbb_phg_fn <- "msbb_phg_normalized_tocluster.txt"
+
+datExpr <- read.csv(file.path(MSBBDATA, msbb_phg_fn),
+                   check.names = FALSE,
+                   stringsAsFactors = FALSE, 
+                   header = TRUE, sep = "\t")
+
+dim(datExpr)
+```
+First, we remove the low expressive genes using a function from here: https://seqqc.wordpress.com/2020/02/17/removing-low-count-genes-for-rna-seq-downstream-analysis/.
+This leaves us with ~30% of the genes.
+```{r}
+library(genefilter)
+
+selectGenes <- function(counts, min.count=10, N=0.90){
+ 
+  lib.size <- colSums(counts)
+  MedianLibSize <- median(lib.size)
+  CPM.Cutoff <- min.count / MedianLibSize*1e6
+  CPM <- edgeR::cpm(counts,lib.size=lib.size)
+ 
+  min.samples <- round(N * ncol(counts))
+ 
+  f1 <- genefilter::kOverA(min.samples, CPM.Cutoff)
+  flist <- genefilter::filterfun(f1)
+  keep <- genefilter::genefilter(CPM, flist)
+ 
+  ## the same as:
+  #keep <- apply(CPM, 1, function(x, n = min.samples){
+  #  t = sum(x >= CPM.Cutoff) >= n
+  #  t
+  #})
+ 
+  return(keep)
+}
+ 
+keep.exprs <- selectGenes(datExpr, min.count=10, N=0.90)
+datExpr <- datExpr[keep.exprs,]
+dim(datExpr)
+```
+
+In order to use WGCNA, we need to transpose the matrix such that the samples are in the rows and the genes in the columns.
+```{r}
+row.names(datExpr) = datExpr$X
+datExpr$X = NULL
+datExpr = as.data.frame(t(datExpr))
+head(datExpr)
+```
+
+Then, we remove all the genes that have missing samples or zero variance. After having reduced reduced the genes to 30% with the previous step there are no genes left with missing samples or zero variance, we still leave this method for potentially changing input.
+```{r}
+library(WGCNA)
+library(flashClust)
+
+gsg = goodSamplesGenes(datExpr)
+
+if (!gsg$allOK)
+   {if (sum(!gsg$goodGenes)>0)
+       printFlush(paste("Removing genes:", paste(names(datExpr)[!gsg$goodGenes], collapse= ", ")));
+       if (sum(!gsg$goodSamples)>0)
+           printFlush(paste("Removing samples:", paste(rownames(datExpr)[!gsg$goodSamples], collapse=", ")))
+       datExpr= datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+dim(datExpr)
+```
+
+```{r}
+msbb_phg_trait_fn <- "msbb_phg_traits.txt"
+
+datTraits <- read.csv(file.path(MSBBDATA, msbb_phg_trait_fn),
+                   check.names = FALSE,
+                   stringsAsFactors = FALSE, 
+                   header = TRUE, sep = "\t")
+
+rownames(datTraits) = datTraits$specimenID
+datTraits$specimenID = NULL
+datTraits <- subset(datTraits, datTraits$CDR>=1.0)
+datTraits <- datTraits[,c("apoeGenotype","CERAD","Braak","CDR")] 
+head(datTraits)
+```
+Making sure that our sample data and gene expression data are correctly aligned.
+```{r}
+table(rownames(datTraits)==rownames(datExpr))
+```
+```{r}
+A = adjacency(t(datExpr),type="signed") # this calculates the whole network connectivity
+k = as.numeric(apply(A,2,sum))-1 # standardized connectivity
+Z.k = scale(k)
+thresholdZ.k = -2.5 # often -2.5
+outlierColor = ifelse(Z.k<thresholdZ.k,"red","black")
+sampleTree = flashClust(as.dist(1-A), method = "average")
+# Convert traits to a color representation where red indicates high values
+traitColors = data.frame(numbers2colors(datTraits,signed=FALSE))
+dimnames(traitColors)[[2]] = paste(names(datTraits))
+datColors = data.frame(outlier = outlierColor,traitColors)
+
+plotDendroAndColors(sampleTree,groupLabels=names(datColors),
+                    colors=datColors,main="Removing outliers: Dendrogram and Heatmap")
+```
+Removing outlying samples.
+```{r}
+remove.samples = Z.k<thresholdZ.k | is.na(Z.k)
+datExprOut = datExpr[!remove.samples,]
+datTraitsOut = datTraits[!remove.samples,]
+#save(datExprOut, datTraitsOut, file="SamplesAndTraits_OutliersRemoved.RData")
+datExprOut
+```
+
+```{r}
+library(doParallel)
+registerDoParallel(cores=4)
+
+powers = c(c(1:10), seq(from =10, to=100, by=5)) #choosing a set of soft-thresholding powers
+sft = pickSoftThreshold(datExpr, powerVector=powers, verbose =5, networkType="signed") #call network topology analysis function
+  
+sizeGrWindow(9,5)
+par(mfrow= c(1,2))
+cex1=0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], xlab= "Soft Threshold (power)", ylab="Scale Free Topology Model Fit, signed R^2", type= "n", main= paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels=powers, cex=cex1, col="red")
+abline(h=0.90, col="red")
+plot(sft$fitIndices[,1], sft$fitIndices[,5], xlab= "Soft Threshold (power)", ylab="Mean Connectivity", type="n", main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1, col="red")
+```
+Here, we choose a softPower of 50 because it's the highest power under the red line for which no error is thrown. Choosing 60 or 65 results in an error of the code below. The minModuleSize of 2000 was picked as it results in exactly three clusters.
+```{r}
+#build a adjacency "correlation" matrix
+enableWGCNAThreads()
+softPower = 50
+adjacency = adjacency(datExpr, power = softPower, type = "signed") #specify network type
+#head(adjacency)
+ 
+# Construct Networks- USE A SUPERCOMPUTER IRL -----------------------------
+#translate the adjacency into topological overlap matrix and calculate the corresponding dissimilarity:
+TOM = TOMsimilarity(adjacency, TOMType="signed") # specify network type
+dissTOM = 1-TOM
+ 
+# Generate Modules --------------------------------------------------------
+ 
+ 
+# Generate a clustered gene tree
+geneTree = flashClust(as.dist(dissTOM), method="average")
+plot(geneTree, xlab="", sub="", main= "Gene Clustering on TOM-based dissimilarity", labels= FALSE, hang=0.04)
+#This sets the minimum number of genes to cluster into a module
+minModuleSize = 2000
+dynamicMods = cutreeDynamic(dendro= geneTree, distM= dissTOM, deepSplit=2, pamRespectsDendro= FALSE, minClusterSize = minModuleSize)
+dynamicColors= labels2colors(dynamicMods)
+MEList= moduleEigengenes(datExpr, colors= dynamicColors,softPower = softPower)
+MEs= MEList$eigengenes
+MEDiss= 1-cor(MEs)
+METree= flashClust(as.dist(MEDiss), method= "average")
+save(dynamicMods, MEList, MEs, MEDiss, METree, file= "Network_allSamples_signed_RLDfiltered.RData")
+ 
+ 
+#plots tree showing how the eigengenes cluster together
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#pdf(file="clusterwithoutmodulecolors.pdf")
+plot(METree, main= "Clustering of module eigengenes", xlab= "", sub= "")
+#set a threhold for merging modules. In this example we are not merging so MEDissThres=0.0
+MEDissThres = 0.0
+merge = mergeCloseModules(datExpr, dynamicColors, cutHeight= MEDissThres, verbose =3)
+mergedColors = merge$colors
+mergedMEs = merge$newMEs
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#dev.off()
+ 
+#plot dendrogram with module colors below it
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#pdf(file="cluster.pdf")
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors), c("Dynamic Tree Cut", "Merged dynamic"), dendroLabels= FALSE, hang=0.03, addGuide= TRUE, guideHang=0.05)
+moduleColors = mergedColors
+colorOrder = c("grey", standardColors(50))
+moduleLabels = match(moduleColors, colorOrder)-1
+MEs = mergedMEs
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+dev.off()
+ 
+save(MEs, moduleLabels, moduleColors, geneTree, file= "Network_allSamples_signed_nomerge_RLDfiltered.RData")
+```
+```{r}
+
+# Correlate traits --------------------------------------------------------
+ 
+ 
+#Define number of genes and samples
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+#Recalculate MEs with color labels
+MEs0 = moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, datTraits, use= "p")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+ 
+ 
+#Print correlation heatmap between modules and traits
+textMatrix= paste(signif(moduleTraitCor, 2), "\n(",
+                        signif(moduleTraitPvalue, 1), ")", sep= "")
+dim(textMatrix)= dim(moduleTraitCor)
+par(mar= c(6, 8.5, 3, 3))
+ 
+ 
+#display the corelation values with a heatmap plot
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#pdf(file="heatmap.pdf")
+labeledHeatmap(Matrix= moduleTraitCor,
+            xLabels= names(datTraits),
+            yLabels= names(MEs),
+            ySymbols= names(MEs),
+            colorLabels= FALSE,
+            colors= blueWhiteRed(50),
+            textMatrix= textMatrix,
+            setStdMargins= FALSE,
+            cex.text= 0.5,
+            zlim= c(-1,1),
+            main= paste("Module-trait relationships"))
+#INCLUE THE NEXT LINE TO SAVE TO FILE
+#dev.off()
+```
+
+```{r}
+length(names(datExpr)[moduleColors=="blue"])
+length(names(datExpr)[moduleColors=="grey"])
+length(names(datExpr)[moduleColors=="turquoise"])
+```
+
